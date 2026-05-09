@@ -54,10 +54,14 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 // Multi-session routing. Set TELEGRAM_ROUTER_MODE=master on the polling process,
-// TELEGRAM_ROUTER_MODE=slave + TELEGRAM_SESSION_NAME=<name> on each Claude Code session.
+// TELEGRAM_ROUTER_MODE=slave on each Claude Code session (no other config needed).
 // Without TELEGRAM_ROUTER_MODE the server behaves exactly as before (single-session).
+//
+// Session identity: uses CLAUDE_CODE_SESSION_ID (auto-set by Claude Code) — first 8 chars.
+// Override with TELEGRAM_SESSION_NAME for a human-readable alias.
 const ROUTER_MODE = process.env.TELEGRAM_ROUTER_MODE as 'master' | 'slave' | undefined
-const SESSION_NAME = process.env.TELEGRAM_SESSION_NAME ?? 'default'
+const CLAUDE_SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID ?? ''
+const SESSION_NAME = process.env.TELEGRAM_SESSION_NAME ?? (CLAUDE_SESSION_ID ? CLAUDE_SESSION_ID.slice(0, 8) : 'default')
 const SESSIONS_DIR = join(STATE_DIR, 'sessions')
 const ACTIVE_SESSION_FILE = join(STATE_DIR, 'active_session')
 const SESSION_INBOX = join(SESSIONS_DIR, SESSION_NAME, 'inbox.jsonl')
@@ -214,12 +218,47 @@ function getAvailableSessions(): string[] {
   try { return readdirSync(SESSIONS_DIR).filter(n => !n.startsWith('.')) } catch { return [] }
 }
 
+function loadSessionMeta(name: string): SessionMeta | null {
+  try {
+    return JSON.parse(readFileSync(join(SESSIONS_DIR, name, 'meta.json'), 'utf8')) as SessionMeta
+  } catch { return null }
+}
+
+function formatSession(name: string, isActive: boolean): string {
+  const meta = loadSessionMeta(name)
+  const cwd = meta?.cwd ? ` [${meta.cwd.replace(homedir(), '~')}]` : ''
+  const marker = isActive ? ' ← active' : ''
+  return `• ${name}${cwd}${marker}`
+}
+
+// Match session by exact name, short session-id prefix, or cwd basename.
+function resolveSession(arg: string, sessions: string[]): string | null {
+  if (sessions.includes(arg)) return arg
+  for (const name of sessions) {
+    if (name.startsWith(arg)) return name
+    const meta = loadSessionMeta(name)
+    if (meta?.cwd && arg === meta.cwd.split('/').pop()) return name
+  }
+  return null
+}
+
+type SessionMeta = { sessionId: string; name: string; cwd: string; startedAt: string }
+
 function startSlaveWatcher(): void {
-  mkdirSync(join(SESSIONS_DIR, SESSION_NAME), { recursive: true })
+  const sessionDir = join(SESSIONS_DIR, SESSION_NAME)
+  mkdirSync(sessionDir, { recursive: true })
+  // Write meta so master can display human-readable info in /sessions.
+  const meta: SessionMeta = {
+    sessionId: CLAUDE_SESSION_ID,
+    name: SESSION_NAME,
+    cwd: process.cwd(),
+    startedAt: new Date().toISOString(),
+  }
+  writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify(meta, null, 2))
   if (!existsSync(SESSION_INBOX)) writeFileSync(SESSION_INBOX, '')
   // Skip messages already in the file at startup — they were sent before this session started.
   let processedLines = readFileSync(SESSION_INBOX, 'utf8').split('\n').filter(l => l.trim()).length
-  process.stderr.write(`telegram channel: slave "${SESSION_NAME}" watching ${SESSION_INBOX}\n`)
+  process.stderr.write(`telegram channel: slave "${SESSION_NAME}" (${meta.cwd}) watching ${SESSION_INBOX}\n`)
   setInterval(() => {
     try {
       const lines = readFileSync(SESSION_INBOX, 'utf8').split('\n').filter(l => l.trim())
@@ -764,21 +803,24 @@ bot.command('switch', async ctx => {
   if (!gated) return
   const sessionArg = ctx.match?.trim()
   const sessions = getAvailableSessions()
+  const current = getActiveSession()
   if (!sessionArg) {
-    const current = getActiveSession()
     const list = sessions.length
-      ? sessions.map(s => s === current ? `• ${s} ← active` : `• ${s}`).join('\n')
+      ? sessions.map(s => formatSession(s, s === current)).join('\n')
       : '(none registered yet)'
     await ctx.reply(`Current session: ${current}\n\nAvailable:\n${list}`)
     return
   }
-  if (!sessions.includes(sessionArg)) {
-    const list = sessions.map(s => `• ${s}`).join('\n') || '(none registered yet)'
-    await ctx.reply(`Unknown session: ${sessionArg}\n\nAvailable:\n${list}`)
+  const resolved = resolveSession(sessionArg, sessions)
+  if (!resolved) {
+    const list = sessions.map(s => formatSession(s, s === current)).join('\n') || '(none registered yet)'
+    await ctx.reply(`No match for: ${sessionArg}\n\nAvailable:\n${list}`)
     return
   }
-  setActiveSession(sessionArg)
-  await ctx.reply(`Switched to: ${sessionArg} ✅`)
+  setActiveSession(resolved)
+  const meta = loadSessionMeta(resolved)
+  const label = meta?.cwd ? `${resolved} [${meta.cwd.replace(homedir(), '~')}]` : resolved
+  await ctx.reply(`Switched to: ${label} ✅`)
 })
 
 bot.command('sessions', async ctx => {
@@ -788,7 +830,7 @@ bot.command('sessions', async ctx => {
   const current = getActiveSession()
   const sessions = getAvailableSessions()
   const list = sessions.length
-    ? sessions.map(s => s === current ? `• ${s} ← active` : `• ${s}`).join('\n')
+    ? sessions.map(s => formatSession(s, s === current)).join('\n')
     : '(none registered yet)'
   await ctx.reply(`Sessions:\n${list}`)
 })
