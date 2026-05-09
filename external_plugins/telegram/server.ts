@@ -729,7 +729,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
+// Master runs standalone (no Claude Code parent) — skip MCP stdio transport.
+if (ROUTER_MODE !== 'master') {
+  await mcp.connect(new StdioServerTransport())
+}
 
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
@@ -749,23 +752,24 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
+// Master runs as standalone daemon — no MCP stdin, no Claude Code parent.
+// Slave and single-session modes are subprocesses of Claude Code and must exit when CC exits.
+if (ROUTER_MODE !== 'master') {
+  process.stdin.on('end', shutdown)
+  process.stdin.on('close', shutdown)
+
+  const bootPpid = process.ppid
+  setInterval(() => {
+    const orphaned =
+      (process.platform !== 'win32' && process.ppid !== bootPpid) ||
+      process.stdin.destroyed ||
+      process.stdin.readableEnded
+    if (orphaned) shutdown()
+  }, 5000).unref()
+}
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
-
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
-setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
-}, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
