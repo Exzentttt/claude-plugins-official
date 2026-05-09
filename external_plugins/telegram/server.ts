@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -53,20 +53,31 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
+// Multi-session routing. Set TELEGRAM_ROUTER_MODE=master on the polling process,
+// TELEGRAM_ROUTER_MODE=slave + TELEGRAM_SESSION_NAME=<name> on each Claude Code session.
+// Without TELEGRAM_ROUTER_MODE the server behaves exactly as before (single-session).
+const ROUTER_MODE = process.env.TELEGRAM_ROUTER_MODE as 'master' | 'slave' | undefined
+const SESSION_NAME = process.env.TELEGRAM_SESSION_NAME ?? 'default'
+const SESSIONS_DIR = join(STATE_DIR, 'sessions')
+const ACTIVE_SESSION_FILE = join(STATE_DIR, 'active_session')
+const SESSION_INBOX = join(SESSIONS_DIR, SESSION_NAME, 'inbox.jsonl')
+
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+if (ROUTER_MODE !== 'slave') {
+  try {
+    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (stale > 1 && stale !== process.pid) {
+      process.kill(stale, 0)
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+    }
+  } catch {}
+  writeFileSync(PID_FILE, String(process.pid))
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -188,6 +199,45 @@ const BOOT_ACCESS: Access | null = STATIC
 
 function loadAccess(): Access {
   return BOOT_ACCESS ?? readAccessFile()
+}
+
+function getActiveSession(): string {
+  try { return readFileSync(ACTIVE_SESSION_FILE, 'utf8').trim() } catch { return SESSION_NAME }
+}
+
+function setActiveSession(name: string): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  writeFileSync(ACTIVE_SESSION_FILE, name)
+}
+
+function getAvailableSessions(): string[] {
+  try { return readdirSync(SESSIONS_DIR).filter(n => !n.startsWith('.')) } catch { return [] }
+}
+
+function startSlaveWatcher(): void {
+  mkdirSync(join(SESSIONS_DIR, SESSION_NAME), { recursive: true })
+  if (!existsSync(SESSION_INBOX)) writeFileSync(SESSION_INBOX, '')
+  // Skip messages already in the file at startup — they were sent before this session started.
+  let processedLines = readFileSync(SESSION_INBOX, 'utf8').split('\n').filter(l => l.trim()).length
+  process.stderr.write(`telegram channel: slave "${SESSION_NAME}" watching ${SESSION_INBOX}\n`)
+  setInterval(() => {
+    try {
+      const lines = readFileSync(SESSION_INBOX, 'utf8').split('\n').filter(l => l.trim())
+      const newLines = lines.slice(processedLines)
+      if (newLines.length === 0) return
+      processedLines = lines.length
+      for (const line of newLines) {
+        try {
+          const params = JSON.parse(line) as { content: string; meta: Record<string, string> }
+          mcp.notification({ method: 'notifications/claude/channel', params }).catch(err => {
+            process.stderr.write(`telegram channel: slave delivery failed: ${err}\n`)
+          })
+        } catch (err) {
+          process.stderr.write(`telegram channel: slave parse error: ${err}\n`)
+        }
+      }
+    } catch {}
+  }, 500).unref()
 }
 
 // Outbound gate — reply/react/edit can only target chats the inbound gate
@@ -650,9 +700,11 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
+  if (ROUTER_MODE !== 'slave') {
+    try {
+      if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+    } catch {}
+  }
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -694,12 +746,51 @@ bot.command('start', async ctx => {
 
 bot.command('help', async ctx => {
   if (!dmCommandGate(ctx)) return
+  const routerLines = ROUTER_MODE === 'master'
+    ? '\n/switch <name> — switch active Claude Code session\n/sessions — list available sessions'
+    : ''
   await ctx.reply(
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `/status — check your pairing state` +
+    routerLines
   )
+})
+
+bot.command('switch', async ctx => {
+  if (ROUTER_MODE !== 'master') return
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const sessionArg = ctx.match?.trim()
+  const sessions = getAvailableSessions()
+  if (!sessionArg) {
+    const current = getActiveSession()
+    const list = sessions.length
+      ? sessions.map(s => s === current ? `• ${s} ← active` : `• ${s}`).join('\n')
+      : '(none registered yet)'
+    await ctx.reply(`Current session: ${current}\n\nAvailable:\n${list}`)
+    return
+  }
+  if (!sessions.includes(sessionArg)) {
+    const list = sessions.map(s => `• ${s}`).join('\n') || '(none registered yet)'
+    await ctx.reply(`Unknown session: ${sessionArg}\n\nAvailable:\n${list}`)
+    return
+  }
+  setActiveSession(sessionArg)
+  await ctx.reply(`Switched to: ${sessionArg} ✅`)
+})
+
+bot.command('sessions', async ctx => {
+  if (ROUTER_MODE !== 'master') return
+  const gated = dmCommandGate(ctx)
+  if (!gated) return
+  const current = getActiveSession()
+  const sessions = getAvailableSessions()
+  const list = sessions.length
+    ? sessions.map(s => s === current ? `• ${s} ← active` : `• ${s}`).join('\n')
+    : '(none registered yet)'
+  await ctx.reply(`Sessions:\n${list}`)
 })
 
 bot.command('status', async ctx => {
@@ -960,26 +1051,42 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
+  const notificationParams = {
+    content: text,
+    meta: {
+      chat_id,
+      ...(msgId != null ? { message_id: String(msgId) } : {}),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_id: attachment.file_id,
+        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
+    },
+  }
+
+  if (ROUTER_MODE === 'master') {
+    const activeSession = getActiveSession()
+    if (activeSession !== SESSION_NAME) {
+      const inboxPath = join(SESSIONS_DIR, activeSession, 'inbox.jsonl')
+      try {
+        mkdirSync(join(SESSIONS_DIR, activeSession), { recursive: true })
+        appendFileSync(inboxPath, JSON.stringify(notificationParams) + '\n')
+      } catch (err) {
+        process.stderr.write(`telegram channel: failed to write to session "${activeSession}": ${err}\n`)
+      }
+      return
+    }
+  }
+
   mcp.notification({
     method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
-    },
+    params: notificationParams,
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
@@ -991,12 +1098,17 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
+// Slave mode: no polling. Watcher started after mcp.connect().
+if (ROUTER_MODE === 'slave') {
+  startSlaveWatcher()
+}
+
 // Retry polling with backoff on any error. Previously only 409 was retried —
 // a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
-void (async () => {
+if (ROUTER_MODE !== 'slave') void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
@@ -1009,6 +1121,10 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              ...(ROUTER_MODE === 'master' ? [
+                { command: 'switch', description: 'Switch active session: /switch <name>' },
+                { command: 'sessions', description: 'List available sessions' },
+              ] : []),
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
